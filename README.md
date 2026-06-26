@@ -30,26 +30,29 @@ Install the following libraries via the Arduino Library Manager:
 - `Adafruit GFX Library`
 - `Adafruit LED Backpack Library`
 - `RTClib` (by Adafruit)
+- `PubSubClient` (by Nick O'Leary)
 - ESP8266 board package (`esp8266:esp8266`) — [install guide](https://arduino-esp8266.readthedocs.io/en/latest/installing.html)
 
 ### 2. Configure secrets
 
-Copy `secrets.h.template` to `secrets.h` and fill in your values:
+Copy `secrets.h.template` to `secrets.h` inside the `esp8266_ntp_clock/` folder and fill in your values:
 
 ```bash
-cp secrets.h.template secrets.h
+cp secrets.h.template esp8266_ntp_clock/secrets.h
 ```
 
-Edit `secrets.h`:
+Edit `esp8266_ntp_clock/secrets.h`:
 
 ```cpp
-#define SECRET_DEVICE_NAME   "kitchen_clock"   // lowercase + underscores only
+#define SECRET_DEVICE_NAME   "kitchen_clock"     // lowercase + underscores only
 #define SECRET_WIFI_SSID     "your_ssid"
 #define SECRET_WIFI_PASSWORD "your_password"
-#define SECRET_HA_TOKEN      "your_ha_token"   // Home Assistant long-lived access token
+#define SECRET_MQTT_HOST     "192.168.1.x"       // IP or hostname of your MQTT broker
+#define SECRET_MQTT_USER     "your_mqtt_user"
+#define SECRET_MQTT_PASSWORD "your_mqtt_password" // set to "" if no auth
 ```
 
-`DEVICE_NAME` drives the Home Assistant entity IDs — e.g. `kitchen_clock` creates `sensor.kitchen_clock_rtc_temperature`.
+`DEVICE_NAME` drives the MQTT topic paths and HA entity IDs — e.g. `kitchen_clock` publishes to `feather_clock/kitchen_clock/rtc_temperature`.
 
 ### 3. Set your timezone
 
@@ -76,12 +79,16 @@ arduino-cli upload --fqbn esp8266:esp8266:huzzah --port /dev/cu.usbserial-XXXX f
 arduino-cli monitor --port /dev/cu.usbserial-XXXX --config baudrate=115200
 ```
 
-## Home Assistant
+## Home Assistant / MQTT
 
-The clock posts three sensor entities to the [Home Assistant REST API](https://developers.home-assistant.io/docs/api/rest/). Generate a long-lived access token under your HA profile and set `HA_HOST` in the sketch if your instance isn't at `homeassistant.local:8123`.
+The clock uses [MQTT discovery](https://www.home-assistant.io/integrations/mqtt/#mqtt-discovery) to register its sensors automatically — no YAML configuration needed. Ensure the **MQTT integration** is enabled in Home Assistant and pointed at the same broker.
 
-| Entity | Unit | Description |
-|--------|------|-------------|
-| `sensor.<name>_rtc_temperature` | °C | DS3231 on-chip temperature |
-| `sensor.<name>_wifi_rssi` | dBm | WiFi signal strength |
-| `sensor.<name>_last_ntp_sync` | — | Local timestamp of last NTP sync |
+Each publish cycle (every 5 minutes) sends retained discovery configs followed by the current state values:
+
+| MQTT topic | Unit | Description |
+|------------|------|-------------|
+| `feather_clock/<name>/rtc_temperature` | °C | DS3231 on-chip temperature |
+| `feather_clock/<name>/wifi_rssi` | dBm | WiFi signal strength |
+| `feather_clock/<name>/last_ntp_sync` | — | ISO 8601 timestamp of last NTP sync |
+
+Discovery payloads are published to `homeassistant/sensor/<name>_<sensor>/config` with `retain=true`, so HA picks them up after a restart even between report cycles. State topics are also retained so dashboards always show the last known value.

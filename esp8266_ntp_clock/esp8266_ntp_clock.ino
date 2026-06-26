@@ -10,19 +10,20 @@
 //        * picks up DST transitions automatically
 //    - On boot, if DS3231 is valid, display starts immediately
 //      with no WiFi needed.
-//    - Every 5 minutes: connect WiFi, post RTC temperature,
-//      last NTP sync time, and RSSI to Home Assistant, then
+//    - Every 5 minutes: connect WiFi, publish RTC temperature,
+//      last NTP sync time, and RSSI to an MQTT broker, then
 //      disconnect.
 // ============================================================
 
 #include <ESP8266WiFi.h>
-#include <ESP8266HTTPClient.h>
 #include <WiFiClient.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include "Adafruit_LEDBackpack.h"
 #include "RTClib.h"             // Adafruit RTClib — covers DS3231
-#include "secrets.h"            // WiFi credentials and API tokens (not checked into source control)
+#define MQTT_MAX_PACKET_SIZE 512  // must precede PubSubClient include for older library versions
+#include <PubSubClient.h>
+#include "secrets.h"            // WiFi/MQTT credentials (not checked into source control)
 
 // ------------------------------------------------------------
 // User configuration
@@ -47,17 +48,22 @@ const int NTP_SERVER_COUNT = 4;
 // Pacific:  "PST8PDT,M3.2.0,M11.1.0"
 const char* POSIX_TZ = "EST5EDT,M3.2.0,M11.1.0";
 
-// Home Assistant REST API
-// Token: Profile → Long-Lived Access Tokens → Create Token
-const char* HA_HOST  = "http://homeassistant.local:8123";
-const char* HA_TOKEN = SECRET_HA_TOKEN;
+// MQTT broker — change MQTT_PORT here if your broker uses a non-standard port
+const char* MQTT_HOST     = SECRET_MQTT_HOST;
+const int   MQTT_PORT     = 1883;
+const char* MQTT_USER     = SECRET_MQTT_USER;
+const char* MQTT_PASSWORD = SECRET_MQTT_PASSWORD;
+
+// State topics:     feather_clock/<device_name>/<sensor>
+// Discovery topics: homeassistant/sensor/<device_name>_<sensor>/config
+const char* MQTT_PREFIX = "feather_clock";
 
 // ------------------------------------------------------------
 // Timing constants
 // ------------------------------------------------------------
 const unsigned long CLOCK_UPDATE_MS  = 1000UL;
 const unsigned long NTP_RESYNC_MS    = 24UL * 60 * 60 * 1000;
-const unsigned long HA_REPORT_MS     = 5UL  * 60 * 1000;
+const unsigned long MQTT_REPORT_MS   = 5UL  * 60 * 1000;
 const unsigned int  WIFI_TIMEOUT_MS  = 10000;
 const unsigned int  WIFI_RETRY_MS    = 500;
 const unsigned long NTP_WAIT_MS      = 15000;
@@ -75,15 +81,20 @@ const bool    SHOW_DOT         = true;  // Dot on digit 1 acts as the colon sepa
 // Epoch time at Jan 1 2020 — any valid NTP response will be larger than this
 const unsigned long EPOCH_2020 = 1577836800UL;
 
+#define C_TO_F(c) ((c) * 9.0f / 5.0f + 32.0f)
+
 // ------------------------------------------------------------
 // Globals
 // ------------------------------------------------------------
 Adafruit_AlphaNum4 display = Adafruit_AlphaNum4();
 RTC_DS3231         rtc;
-unsigned long      lastClockUpdate = 0;
-unsigned long      lastNtpSync     = 0;
-unsigned long      lastHaReport    = 0;
-char               lastNtpSyncStr[32] = "Never";  // Human-readable last sync time
+WiFiClient         wifiClient;
+PubSubClient       mqtt(wifiClient);
+unsigned long      lastClockUpdate  = 0;
+unsigned long      lastNtpSync      = 0;
+unsigned long      lastMqttReport   = 0;
+int                lastDisplayedMin = -1;
+char               lastNtpSyncStr[32] = "Never";  // ISO 8601 local time of last NTP sync
 
 // ------------------------------------------------------------
 // Display helpers
@@ -205,15 +216,16 @@ bool syncNTP() {
   rtc.adjust(DateTime(utc));
 
   struct tm local = utcToLocal(utc);
-  snprintf(lastNtpSyncStr, sizeof(lastNtpSyncStr), "%04d-%02d-%02d %02d:%02d:%02d",
+  // ISO 8601 format — required by HA's timestamp device class
+  snprintf(lastNtpSyncStr, sizeof(lastNtpSyncStr), "%04d-%02d-%02dT%02d:%02d:%02d",
            local.tm_year + 1900, local.tm_mon + 1, local.tm_mday,
            local.tm_hour, local.tm_min, local.tm_sec);
 
   Serial.printf("DS3231 updated. Local time: %s (DST %s)\n",
                 lastNtpSyncStr, local.tm_isdst ? "ON" : "OFF");
 
-  // Report to HA immediately after NTP sync while WiFi is already up
-  reportToHomeAssistant();
+  // Report to MQTT immediately after NTP sync while WiFi is already up
+  reportToMQTT();
 
   disconnectWiFi();
   return true;
@@ -238,75 +250,92 @@ bool rtcIsValid() {
 }
 
 // ------------------------------------------------------------
-// Home Assistant helpers
+// MQTT helpers
 // ------------------------------------------------------------
 
-// POST a single sensor state to the Home Assistant REST API.
-bool postToHA(WiFiClient& wifiClient, const char* entityId,
-              const char* state, const char* unit,
-              const char* friendlyName, const char* deviceClass) {
-  HTTPClient http;
-  String url = String(HA_HOST) + "/api/states/" + entityId;
+// Connect to the MQTT broker. Returns true on success.
+bool connectMQTT() {
+  mqtt.setServer(MQTT_HOST, MQTT_PORT);
+  mqtt.setBufferSize(512);  // for discovery payloads; belt-and-suspenders with the #define above
 
-  http.begin(wifiClient, url);
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("Authorization", String("Bearer ") + HA_TOKEN);
-
-  // Build JSON payload with state and attributes
-  String payload = "{\"state\":\"" + String(state) + "\","
-                   "\"attributes\":{"
-                   "\"unit_of_measurement\":\"" + unit + "\","
-                   "\"friendly_name\":\"" + friendlyName + "\","
-                   "\"device_class\":\"" + deviceClass + "\"}}";
-
-  int httpCode = http.POST(payload);
-  bool success = (httpCode == 200 || httpCode == 201);
-
-  Serial.printf("HA POST %s → HTTP %d\n", entityId, httpCode);
-  http.end();
-  return success;
+  String clientId = String("feather_clock_") + DEVICE_NAME;
+  if (mqtt.connect(clientId.c_str(), MQTT_USER, MQTT_PASSWORD)) {
+    Serial.println("MQTT connected.");
+    return true;
+  }
+  Serial.printf("MQTT connect failed, rc=%d\n", mqtt.state());
+  return false;
 }
 
-void reportToHomeAssistant() {
+// Publish HA MQTT discovery payloads so Home Assistant auto-discovers all
+// three sensors without manual YAML configuration. Published with retain=true
+// so HA picks them up after a restart even before the next report cycle.
+void publishDiscovery() {
+  String base        = String(DEVICE_NAME);
+  String deviceLabel = base;
+  deviceLabel.replace("_", " ");
+  deviceLabel[0]     = toupper(deviceLabel[0]);
+
+  String stateBase = String(MQTT_PREFIX) + "/" + base + "/";
+  String discBase  = "homeassistant/sensor/" + base + "_";
+
+  struct Sensor { const char* id; const char* name; const char* unit; const char* cls; };
+  Sensor sensors[] = {
+    { "rtc_temperature", "RTC Temperature", "\xc2\xb0""F", "temperature"     },
+    { "wifi_rssi",       "WiFi RSSI",       "dBm",          "signal_strength" },
+    { "last_ntp_sync",   "Last NTP Sync",   "",             "timestamp"       },
+  };
+
+  for (auto& s : sensors) {
+    String payload = "{\"name\":\"" + deviceLabel + " " + s.name + "\","
+                     "\"state_topic\":\"" + stateBase + s.id + "\","
+                     "\"unique_id\":\"" + base + "_" + s.id + "\"";
+    if (strlen(s.unit) > 0)
+      payload += ",\"unit_of_measurement\":\"" + String(s.unit) + "\"";
+    if (strlen(s.cls) > 0)
+      payload += ",\"device_class\":\"" + String(s.cls) + "\"";
+    payload += ",\"device\":{\"identifiers\":[\"" + base + "\"],"
+               "\"name\":\"" + deviceLabel + "\",\"model\":\"Feather Clock\"}}";
+
+    mqtt.publish((discBase + s.id + "/config").c_str(), payload.c_str(), true);
+    Serial.printf("Discovery: %s\n", s.id);
+  }
+}
+
+// Publish sensor states to MQTT, assuming WiFi is already connected.
+// Handles MQTT connect/disconnect internally.
+void reportToMQTT() {
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("HA report skipped: no WiFi.");
+    Serial.println("MQTT report skipped: no WiFi.");
     return;
   }
 
-  WiFiClient wifiClient;
+  if (!connectMQTT()) return;
 
-  // Build entity IDs and friendly names from the device name so
-  // multiple clocks post to separate sensors in Home Assistant.
-  String prefix      = String("sensor.") + DEVICE_NAME + "_";
-  String namePrefix  = String(DEVICE_NAME);
-  namePrefix.replace("_", " ");  // "kitchen_clock" → "Kitchen clock"
-  namePrefix[0] = toupper(namePrefix[0]);
+  publishDiscovery();
 
-  // DS3231 temperature
-  float tempC = rtc.getTemperature();
-  char tempStr[8];
-  snprintf(tempStr, sizeof(tempStr), "%.2f", tempC);
-  postToHA(wifiClient, (prefix + "rtc_temperature").c_str(),
-           tempStr, "°C", (namePrefix + " RTC Temperature").c_str(), "temperature");
+  String prefix = String(MQTT_PREFIX) + "/" + DEVICE_NAME + "/";
 
-  // Last NTP sync timestamp
-  postToHA(wifiClient, (prefix + "last_ntp_sync").c_str(),
-           lastNtpSyncStr, "", (namePrefix + " Last NTP Sync").c_str(), "timestamp");
+  float tempF = C_TO_F(rtc.getTemperature());
+  char  tempStr[8];
+  snprintf(tempStr, sizeof(tempStr), "%.2f", tempF);
+  mqtt.publish((prefix + "rtc_temperature").c_str(), tempStr, true);
 
-  // WiFi signal strength
+  mqtt.publish((prefix + "last_ntp_sync").c_str(), lastNtpSyncStr, true);
+
   char rssiStr[8];
   snprintf(rssiStr, sizeof(rssiStr), "%d", WiFi.RSSI());
-  postToHA(wifiClient, (prefix + "wifi_rssi").c_str(),
-           rssiStr, "dBm", (namePrefix + " WiFi RSSI").c_str(), "signal_strength");
+  mqtt.publish((prefix + "wifi_rssi").c_str(), rssiStr, true);
 
-  Serial.println("HA report complete.");
+  mqtt.disconnect();
+  Serial.println("MQTT report complete.");
 }
 
-// Connect WiFi, report to HA, disconnect.
-void reportToHomeAssistantWithWiFi() {
+// Connect WiFi, report to MQTT, disconnect.
+void reportToMQTTWithWiFi() {
   connectWiFi();
   if (WiFi.status() != WL_CONNECTED) return;
-  reportToHomeAssistant();
+  reportToMQTT();
   disconnectWiFi();
 }
 
@@ -317,6 +346,7 @@ void reportToHomeAssistantWithWiFi() {
 void setup() {
   Serial.begin(115200);
   delay(500);
+  Serial.println("\n=== Feather Clock starting ===");
 
   display.begin(DISPLAY_I2C_ADDR);
   showMessage("----");
@@ -346,7 +376,7 @@ void setup() {
   }
 
   lastNtpSync     = millis();
-  lastHaReport    = millis();
+  lastMqttReport  = millis();
   lastClockUpdate = millis();
 }
 
@@ -359,15 +389,15 @@ void loop() {
 
   // Sync DS3231 from NTP once per day — corrects drift and picks up DST changes
   if (now - lastNtpSync >= NTP_RESYNC_MS) {
-    syncNTP();  // Also reports to HA while WiFi is up
-    lastNtpSync  = millis();
-    lastHaReport = millis();  // Reset HA timer so we don't double-report
+    syncNTP();  // Also reports to MQTT while WiFi is up
+    lastNtpSync    = millis();
+    lastMqttReport = millis();  // Reset MQTT timer so we don't double-report
   }
 
-  // Report to Home Assistant every 5 minutes
-  if (now - lastHaReport >= HA_REPORT_MS) {
-    reportToHomeAssistantWithWiFi();
-    lastHaReport = millis();
+  // Publish sensor data to MQTT every 5 minutes
+  if (now - lastMqttReport >= MQTT_REPORT_MS) {
+    reportToMQTTWithWiFi();
+    lastMqttReport = millis();
   }
 
   // Update display once per second — read UTC from DS3231, convert to local
@@ -376,5 +406,10 @@ void loop() {
     time_t utc = rtc.now().unixtime();
     struct tm local = utcToLocal(utc);
     showTime(local.tm_hour, local.tm_min);
+    if (local.tm_min != lastDisplayedMin) {
+      lastDisplayedMin = local.tm_min;
+      Serial.printf("Display: %02d:%02d (DST %s)\n",
+                    local.tm_hour, local.tm_min, local.tm_isdst ? "ON" : "OFF");
+    }
   }
 }
