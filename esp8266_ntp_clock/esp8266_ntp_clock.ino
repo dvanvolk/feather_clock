@@ -10,9 +10,11 @@
 //        * picks up DST transitions automatically
 //    - On boot, if DS3231 is valid, display starts immediately
 //      with no WiFi needed.
-//    - Every 5 minutes: connect WiFi, publish RTC temperature,
-//      last NTP sync time, and RSSI to an MQTT broker, then
-//      disconnect.
+//    - Every 5 minutes: connect WiFi, publish DHT22 temperature,
+//      humidity, RTC temperature, last NTP sync time, and RSSI to
+//      an MQTT broker, then disconnect.
+//    - Blocking WiFi operations are gated to seconds 10–45 of any
+//      minute so the display never misses a minute-rollover tick.
 // ============================================================
 
 #include <ESP8266WiFi.h>
@@ -23,6 +25,7 @@
 #include "RTClib.h"             // Adafruit RTClib — covers DS3231
 #define MQTT_MAX_PACKET_SIZE 512  // must precede PubSubClient include for older library versions
 #include <PubSubClient.h>
+#include <DHT.h>
 #include "secrets.h"            // WiFi/MQTT credentials (not checked into source control)
 
 // ------------------------------------------------------------
@@ -83,11 +86,15 @@ const unsigned long EPOCH_2020 = 1577836800UL;
 
 #define C_TO_F(c) ((c) * 9.0f / 5.0f + 32.0f)
 
+#define DHT_PIN  14    // GPIO14 — not a boot pin, not used by I2C
+#define DHT_TYPE DHT22
+
 // ------------------------------------------------------------
 // Globals
 // ------------------------------------------------------------
 Adafruit_AlphaNum4 display = Adafruit_AlphaNum4();
 RTC_DS3231         rtc;
+DHT                dht(DHT_PIN, DHT_TYPE);
 WiFiClient         wifiClient;
 PubSubClient       mqtt(wifiClient);
 unsigned long      lastClockUpdate  = 0;
@@ -95,6 +102,8 @@ unsigned long      lastNtpSync      = 0;
 unsigned long      lastMqttReport   = 0;
 int                lastDisplayedMin = -1;
 char               lastNtpSyncStr[32] = "Never";  // ISO 8601 local time of last NTP sync
+bool               mqttReportPending = false;
+bool               ntpSyncPending    = false;
 
 // ------------------------------------------------------------
 // Display helpers
@@ -281,6 +290,8 @@ void publishDiscovery() {
 
   struct Sensor { const char* id; const char* name; const char* unit; const char* cls; };
   Sensor sensors[] = {
+    { "dht_temperature", "Temperature",     "\xc2\xb0""F", "temperature"     },
+    { "dht_humidity",    "Humidity",        "%",            "humidity"        },
     { "rtc_temperature", "RTC Temperature", "\xc2\xb0""F", "temperature"     },
     { "wifi_rssi",       "WiFi RSSI",       "dBm",          "signal_strength" },
     { "last_ntp_sync",   "Last NTP Sync",   "",             "timestamp"       },
@@ -315,6 +326,18 @@ void reportToMQTT() {
   publishDiscovery();
 
   String prefix = String(MQTT_PREFIX) + "/" + DEVICE_NAME + "/";
+
+  float dhtTempF = C_TO_F(dht.readTemperature());
+  float dhtHumid = dht.readHumidity();
+  if (!isnan(dhtTempF) && !isnan(dhtHumid)) {
+    char dhtTempStr[8], dhtHumStr[8];
+    snprintf(dhtTempStr, sizeof(dhtTempStr), "%.1f", dhtTempF);
+    snprintf(dhtHumStr,  sizeof(dhtHumStr),  "%.1f", dhtHumid);
+    mqtt.publish((prefix + "dht_temperature").c_str(), dhtTempStr, true);
+    mqtt.publish((prefix + "dht_humidity").c_str(),    dhtHumStr,  true);
+  } else {
+    Serial.println("DHT22 read failed — skipping publish.");
+  }
 
   float tempF = C_TO_F(rtc.getTemperature());
   char  tempStr[8];
@@ -360,6 +383,13 @@ void setup() {
   // Log DS3231 temperature as a hardware sanity check
   Serial.printf("DS3231 temperature: %.2f °C\n", rtc.getTemperature());
 
+  dht.begin();
+  float dhtC = dht.readTemperature();
+  if (!isnan(dhtC))
+    Serial.printf("DHT22: %.2f °C, %.1f %%RH\n", dhtC, dht.readHumidity());
+  else
+    Serial.println("DHT22: no reading at startup.");
+
   if (!rtcIsValid()) {
     Serial.println("RTC unset — syncing from NTP.");
     if (!syncNTP()) {
@@ -381,26 +411,47 @@ void setup() {
 }
 
 // ------------------------------------------------------------
+// Safe-window helper
+// ------------------------------------------------------------
+
+// Returns true when it is safe to start a blocking WiFi operation.
+// Only allowed during seconds 10–45 of any minute so that the
+// display never freezes through a minute-rollover tick.
+bool safeToStartWiFi() {
+  int s = rtc.now().second();
+  return s >= 10 && s <= 45;
+}
+
+// ------------------------------------------------------------
 // Main loop
 // ------------------------------------------------------------
 
 void loop() {
   unsigned long now = millis();
 
-  // Sync DS3231 from NTP once per day — corrects drift and picks up DST changes
-  if (now - lastNtpSync >= NTP_RESYNC_MS) {
-    syncNTP();  // Also reports to MQTT while WiFi is up
-    lastNtpSync    = millis();
-    lastMqttReport = millis();  // Reset MQTT timer so we don't double-report
+  // Flag operations as pending when their timer expires
+  if (now - lastNtpSync >= NTP_RESYNC_MS)
+    ntpSyncPending = true;
+  if (now - lastMqttReport >= MQTT_REPORT_MS)
+    mqttReportPending = true;
+
+  // Execute pending operations only inside the safe window (seconds 10–45)
+  // so the display never freezes through a minute-rollover tick.
+  if (safeToStartWiFi()) {
+    if (ntpSyncPending) {
+      syncNTP();              // piggybacks MQTT report while WiFi is up
+      lastNtpSync       = millis();
+      lastMqttReport    = millis();
+      ntpSyncPending    = false;
+      mqttReportPending = false;
+    } else if (mqttReportPending) {
+      reportToMQTTWithWiFi();
+      lastMqttReport    = millis();
+      mqttReportPending = false;
+    }
   }
 
-  // Publish sensor data to MQTT every 5 minutes
-  if (now - lastMqttReport >= MQTT_REPORT_MS) {
-    reportToMQTTWithWiFi();
-    lastMqttReport = millis();
-  }
-
-  // Update display once per second — read UTC from DS3231, convert to local
+  // Update display once per second — always runs, never blocked by WiFi
   if (now - lastClockUpdate >= CLOCK_UPDATE_MS) {
     lastClockUpdate = millis();
     time_t utc = rtc.now().unixtime();
