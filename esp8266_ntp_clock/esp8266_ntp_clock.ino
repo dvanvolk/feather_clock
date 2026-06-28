@@ -35,14 +35,10 @@ const char* WIFI_SSID      = SECRET_WIFI_SSID;
 const char* WIFI_PASSWORD  = SECRET_WIFI_PASSWORD;
 const char* DEVICE_NAME    = SECRET_DEVICE_NAME;
 
-// NTP servers tried in order — IP addresses avoid DNS dependency
-const char* NTP_SERVERS[]  = {
-  "216.239.35.0",   // time1.google.com
-  "216.239.35.4",   // time2.google.com
-  "129.6.15.28",    // time.nist.gov
-  "pool.ntp.org"
-};
-const int NTP_SERVER_COUNT = 4;
+// NTP servers — passed to configTime() all at once so the first responder wins
+const char* NTP_SERVER_1 = "216.239.35.0";   // time1.google.com
+const char* NTP_SERVER_2 = "216.239.35.4";   // time2.google.com
+const char* NTP_SERVER_3 = "129.6.15.28";    // time.nist.gov
 
 // POSIX timezone string — handles DST transitions automatically.
 // Eastern:  "EST5EDT,M3.2.0,M11.1.0"
@@ -178,28 +174,27 @@ void disconnectWiFi() {
 // ------------------------------------------------------------
 
 // Fetch UTC time from NTP and return as Unix epoch, or 0 on failure.
-// configTime(0, 0, ...) retrieves raw UTC — timezone applied separately.
+// Uses the 2-arg POSIX-TZ overload of configTime() so the SDK-level timezone
+// stays consistent with POSIX_TZ (fixes localtime_r returning UTC on ESP8266).
+// All three servers are passed at once; the first to respond wins.
 time_t fetchNTP() {
   delay(500);  // Let the stack settle after WiFi connect
 
-  for (int i = 0; i < NTP_SERVER_COUNT; i++) {
-    Serial.printf("Trying NTP server: %s\n", NTP_SERVERS[i]);
-    configTime(0, 0, NTP_SERVERS[i]);  // UTC only — no offset here
+  Serial.printf("Fetching NTP from %s, %s, %s\n", NTP_SERVER_1, NTP_SERVER_2, NTP_SERVER_3);
+  configTime(POSIX_TZ, NTP_SERVER_1, NTP_SERVER_2, NTP_SERVER_3);
 
-    unsigned long start = millis();
-    time_t utc = time(nullptr);
-    while (utc < EPOCH_2020 && millis() - start < NTP_WAIT_MS) {
-      delay(100);
-      Serial.print(".");
-      utc = time(nullptr);
-    }
-    Serial.println();
+  unsigned long start = millis();
+  time_t utc = time(nullptr);
+  while (utc < EPOCH_2020 && millis() - start < NTP_WAIT_MS) {
+    delay(100);
+    Serial.print(".");
+    utc = time(nullptr);
+  }
+  Serial.println();
 
-    if (utc >= EPOCH_2020) {
-      Serial.printf("NTP UTC: %s", ctime(&utc));
-      return utc;
-    }
-    Serial.printf("No response from %s, trying next...\n", NTP_SERVERS[i]);
+  if (utc >= EPOCH_2020) {
+    Serial.printf("NTP UTC: %s", ctime(&utc));
+    return utc;
   }
 
   Serial.println("NTP sync failed: all servers timed out.");
@@ -344,7 +339,10 @@ void reportToMQTT() {
   snprintf(tempStr, sizeof(tempStr), "%.2f", tempF);
   mqtt.publish((prefix + "rtc_temperature").c_str(), tempStr, true);
 
-  mqtt.publish((prefix + "last_ntp_sync").c_str(), lastNtpSyncStr, true);
+  // Skip until we have a real sync — "Never" is not a valid ISO 8601
+  // timestamp and causes HA to show the sensor as "unknown".
+  if (strcmp(lastNtpSyncStr, "Never") != 0)
+    mqtt.publish((prefix + "last_ntp_sync").c_str(), lastNtpSyncStr, true);
 
   char rssiStr[8];
   snprintf(rssiStr, sizeof(rssiStr), "%d", WiFi.RSSI());
@@ -370,6 +368,13 @@ void setup() {
   Serial.begin(115200);
   delay(500);
   Serial.println("\n=== Feather Clock starting ===");
+
+  // Initialize POSIX timezone rules before any localtime_r calls.
+  // On ESP8266, setenv("TZ") has no effect until the time subsystem is
+  // initialized — doing it here ensures correct local time even when NTP
+  // sync is skipped because the RTC is already valid.
+  setenv("TZ", POSIX_TZ, 1);
+  tzset();
 
   display.begin(DISPLAY_I2C_ADDR);
   showMessage("----");
@@ -431,20 +436,29 @@ void loop() {
 
   // Flag operations as pending when their timer expires
   if (now - lastNtpSync >= NTP_RESYNC_MS)
+  {
     ntpSyncPending = true;
+  }
+
   if (now - lastMqttReport >= MQTT_REPORT_MS)
+  {
     mqttReportPending = true;
+  }
 
   // Execute pending operations only inside the safe window (seconds 10–45)
   // so the display never freezes through a minute-rollover tick.
-  if (safeToStartWiFi()) {
-    if (ntpSyncPending) {
+  if (safeToStartWiFi()) 
+  {
+    if (ntpSyncPending) 
+    {
       syncNTP();              // piggybacks MQTT report while WiFi is up
       lastNtpSync       = millis();
       lastMqttReport    = millis();
       ntpSyncPending    = false;
       mqttReportPending = false;
-    } else if (mqttReportPending) {
+    } 
+    else if (mqttReportPending)
+    {
       reportToMQTTWithWiFi();
       lastMqttReport    = millis();
       mqttReportPending = false;
@@ -452,12 +466,14 @@ void loop() {
   }
 
   // Update display once per second — always runs, never blocked by WiFi
-  if (now - lastClockUpdate >= CLOCK_UPDATE_MS) {
+  if (now - lastClockUpdate >= CLOCK_UPDATE_MS) 
+  {
     lastClockUpdate = millis();
     time_t utc = rtc.now().unixtime();
     struct tm local = utcToLocal(utc);
     showTime(local.tm_hour, local.tm_min);
-    if (local.tm_min != lastDisplayedMin) {
+    if (local.tm_min != lastDisplayedMin) 
+    {
       lastDisplayedMin = local.tm_min;
       Serial.printf("Display: %02d:%02d (DST %s)\n",
                     local.tm_hour, local.tm_min, local.tm_isdst ? "ON" : "OFF");
